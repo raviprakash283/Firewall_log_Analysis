@@ -24,14 +24,24 @@ class FirewallAnalyzer:
         self.df = None
         self.geo_reader = Reader("geoip/GeoLite2-City.mmdb")
 
-    #  Detect log format
     def detect_format(self, line: str):
-        if line.count(",") > 3:
-            return ","
-        elif line.count("|") > 3:
-            return "|"
-        else:
-            return None  # raw log format
+    
+        # Common delimiters
+        delimiters = [",", "|", ";", "\t"]
+        
+        counts = {d: line.count(d) for d in delimiters}
+
+        best_delim = max(counts, key=counts.get)
+        best_count = counts[best_delim]
+
+        if best_count >= 3:
+            print(f"[+] Detected delimited format ('{best_delim}')")
+            return best_delim
+
+        # Otherwise treat as raw key=value style (Fortigate-style)
+        print("[+] Detected raw/key=value log format (will use regex/key=value parser)")
+        return None
+
 
     #  Parse log file
     def parse_log(self):
@@ -58,19 +68,57 @@ class FirewallAnalyzer:
 
     #  Regex parsing for raw firewall logs
     def regex_parse(self):
+   
         rows = []
-        pattern = re.compile(
+        # Simple fallback regex (kept from original) for lines that match expected netfilter-like format
+        fallback_pattern = re.compile(
             r'(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})?.*src=(?P<src_ip>[\d\.]+).*dst=(?P<dest_ip>[\d\.]+).*'
-            r'spt=(?P<src_port>\d+).*dpt=(?P<dest_port>\d+).*proto=(?P<protocol>[A-Za-z]+).*action=(?P<action>\w+)'
+            r'spt=(?P<src_port>\d+).*dpt=(?P<dest_port>\d+).*proto=(?P<protocol>[A-Za-z]+).*action=(?P<action>\w+)',
+            flags=re.IGNORECASE
         )
 
-        with open(self.log_path, "r") as f:
+        with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                match = pattern.search(line)
-                if match:
-                    rows.append(match.groupdict())
+                line = line.strip()
+                if not line:
+                    continue
 
+                # Try key=value parsing first (handles Fortigate logs)
+                tokens = re.split(r'\s+|\t+', line)
+                kv_found = False
+                fields = {}
+
+                for token in tokens:
+                    if "=" not in token:
+                        continue
+                    kv_found = True
+                    key, val = token.split("=", 1)
+                    # remove surrounding quotes if present
+                    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+                        val = val[1:-1]
+                    fields[key] = val
+
+                if kv_found:
+                    # Build a reasonable timestamp if date and time are present separately
+                    if "date" in fields and "time" in fields and "timestamp" not in fields:
+                        try:
+                            fields["timestamp"] = f"{fields.get('date','') } {fields.get('time','')}"
+                        except Exception:
+                            pass
+                    rows.append(fields)
+                    continue
+
+                # Fallback to original regex search (for non key=value raw logs)
+                m = fallback_pattern.search(line)
+                if m:
+                    rows.append(m.groupdict())
+                else:
+                    # If a line doesn't match either pattern, keep it as raw message
+                    rows.append({"raw": line})
+
+        # Normalize to DataFrame (missing keys become NaN/None)
         return pd.DataFrame(rows)
+
 
     #  Normalize timestamp & IP types
     def normalize_data(self):
@@ -207,7 +255,7 @@ class FirewallAnalyzer:
         # NEW: Generate Visuals
         self.generate_visualizations()
 
-        print("\n📌 Reports created successfully!")
+        print("\n Reports created successfully!")
         print("parsed_logs.xlsx")
         print("threat_intel_report.xlsx")
         print("alerts.xlsx")
